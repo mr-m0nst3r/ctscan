@@ -1,0 +1,18 @@
+[
+  {
+    "name": "Let's Encrypt",
+    "filter": "issuer_org == \"Let's Encrypt\""
+  },
+  {
+    "name": "China issuer",
+    "filter": "issuer_country == 'CN'"
+  },
+  {
+    "name": "NXDOMAIN",
+    "filter": "is_nxdomain(domain)"
+  },
+  {
+    "name": ".cn and NXDOMAIN",
+    "filter": "endswith(domain, '.cn') and is_nxdomain(domain)"
+  }
+]
