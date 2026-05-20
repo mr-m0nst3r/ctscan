@@ -288,4 +288,8 @@ pytest
 
 ## License
 
-MIT
+Copyright (C) 2026 mr-m0nst3r
+
+This program is free software: you can redistribute it and/or modify it under the terms of the [GNU General Public License v3.0](LICENSE) (GPL-3.0-or-later), or at your option, any later version published by the Free Software Foundation.
+
+See [LICENSE](LICENSE) for the full license text.
