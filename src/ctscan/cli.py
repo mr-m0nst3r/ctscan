@@ -17,6 +17,8 @@ from ctscan.ct.log_list import (
 )
 from ctscan.ct.client import CtClient
 from ctscan.pipeline.scanner import ScanOptions, Scanner
+from ctscan.psl import CertBrCheckResult, get_br_icann_checker
+from ctscan.psl.loader import load_psl
 from ctscan.rules.sql import parse_sql_query
 from ctscan.storage.certs_io import (
     default_certs_dir,
@@ -31,6 +33,43 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
+
+
+def _print_cert_br_check(result: CertBrCheckResult) -> None:
+    title = "BR ICANN PSL check"
+    if result.log_index is not None:
+        title += f" (log_index {result.log_index})"
+    if result.all_ok:
+        console.print(f"[green]{title}: PASS[/] ({result.dns_checked} DNS name(s))")
+    else:
+        console.print(
+            f"[red]{title}: FAIL[/] "
+            f"({result.dns_failed}/{result.dns_checked} DNS name(s) non-compliant)"
+        )
+    table = Table()
+    table.add_column("Name")
+    table.add_column("Kind")
+    table.add_column("Public suffix")
+    table.add_column("PSL section")
+    table.add_column("OK")
+    table.add_column("Reason")
+    for d in result.domains:
+        ok_s = "—"
+        if d.br_icann_ok is True:
+            ok_s = "yes"
+        elif d.br_icann_ok is False:
+            ok_s = "no"
+        style = "red" if d.br_icann_ok is False else None
+        table.add_row(
+            d.name,
+            d.kind,
+            d.public_suffix or "—",
+            d.psl_section or "—",
+            ok_s,
+            d.reason,
+            style=style,
+        )
+    console.print(table)
 
 
 def _resolve_log_uri(log_uri: str | None, pick: bool) -> str:
@@ -192,6 +231,11 @@ def cmd_scan(
     proxy: Optional[str] = typer.Option(
         None, "--proxy", help="Explicit proxy URL (overrides environment)"
     ),
+    require_br_icann: bool = typer.Option(
+        False,
+        "--require-br-icann",
+        help="Only keep certs whose DNS names use PSL ICANN DOMAINS (not PRIVATE)",
+    ),
     db_path: Optional[Path] = typer.Option(
         None, "--db", help="SQLite path (default ~/.ctscan/ctscan.db)"
     ),
@@ -223,6 +267,11 @@ def cmd_scan(
             f"Will save hit PEMs → [cyan]{default_certs_dir().resolve()}[/]\n"
         )
 
+    if require_br_icann:
+        console.print(
+            "Mode: [yellow]BR ICANN PSL[/] — skip certs with PRIVATE DOMAINS suffixes\n"
+        )
+
     db = Database(db_path) if db_path else Database()
     try:
         scanner = Scanner(db=db, console=console)
@@ -242,12 +291,112 @@ def cmd_scan(
                 verbose=verbose,
                 trust_env=use_env_proxy and proxy is None,
                 proxy=proxy,
+                require_br_icann=require_br_icann,
             )
         )
     except SystemExit:
         raise typer.Exit(1)
     finally:
         db.close()
+
+
+@app.command("check-br")
+def cmd_check_br(
+    domain: list[str] = typer.Option(
+        [], "--domain", "-d", help="DNS name to check (repeatable)"
+    ),
+    pem: Optional[Path] = typer.Option(
+        None, "--pem", help="Certificate PEM file to check all SAN DNS names"
+    ),
+    log_uri: Optional[str] = typer.Option(
+        None, "--log-uri", help="CT log URL (with --log-index)"
+    ),
+    log_index: Optional[int] = typer.Option(
+        None, "--log-index", help="Fetch this CT entry and check its certificate"
+    ),
+    refresh_psl: bool = typer.Option(
+        False, "--refresh-psl", help="Re-download public_suffix_list.dat"
+    ),
+    use_env_proxy: bool = typer.Option(False, "--use-env-proxy"),
+    proxy: Optional[str] = typer.Option(None, "--proxy"),
+):
+    """
+    Check whether certificate DNS names use PSL **ICANN DOMAINS** (BR audit helper).
+
+    Names whose public suffix appears only under **PRIVATE DOMAINS** in the
+    Mozilla PSL (e.g. blogspot.com, github.io) are reported as non-compliant.
+    """
+    if refresh_psl:
+        load_psl(force_refresh=True)
+        get_br_icann_checker.cache_clear()
+
+    from ctscan.psl.loader import psl_cache_path
+
+    checker = get_br_icann_checker()
+    console.print(f"[dim]PSL cache: {psl_cache_path()}[/]\n")
+
+    exit_code = 0
+
+    if pem:
+        from cryptography import x509
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives.serialization import Encoding
+
+        from ctscan.ct.x509_parse import parse_der_certificate
+
+        der = pem.read_bytes()
+        try:
+            cert_obj = x509.load_pem_x509_certificate(der, default_backend())
+            der = cert_obj.public_bytes(encoding=Encoding.DER)
+        except Exception as exc:
+            console.print(f"[red]Invalid PEM:[/] {exc}")
+            raise typer.Exit(1)
+        rec = parse_der_certificate(log_index or 0, der)
+        result = checker.check_cert(rec)
+        _print_cert_br_check(result)
+        if not result.all_ok:
+            exit_code = 1
+
+    elif log_uri and log_index is not None:
+        uri = log_uri.rstrip("/") + "/"
+        with CtClient(
+            uri, trust_env=use_env_proxy and proxy is None, proxy=proxy
+        ) as ct:
+            raw = ct.get_entries(log_index, log_index)
+            if not raw:
+                console.print("[red]get-entries returned no data[/]")
+                raise typer.Exit(1)
+            rec = ct.parse_entry_at_index(log_index, raw[0])
+            if not rec:
+                console.print("[red]Could not parse certificate from CT entry[/]")
+                raise typer.Exit(1)
+            result = checker.check_cert(rec)
+            _print_cert_br_check(result)
+            if not result.all_ok:
+                exit_code = 1
+
+    elif domain:
+        for name in domain:
+            r = checker.check_name(name)
+            ok = r.br_icann_ok
+            if ok is True:
+                console.print(f"[green]PASS[/] {name}")
+            elif ok is False:
+                console.print(f"[red]FAIL[/] {name}")
+                exit_code = 1
+            else:
+                console.print(f"[yellow]SKIP[/] {name} — {r.reason}")
+            console.print(
+                f"  suffix={r.public_suffix or '—'} "
+                f"section={r.psl_section or '—'} · {r.reason}"
+            )
+    else:
+        console.print(
+            "[red]Specify --domain, --pem, or --log-uri with --log-index[/]"
+        )
+        raise typer.Exit(1)
+
+    raise typer.Exit(exit_code)
 
 
 @app.command("save-certs")

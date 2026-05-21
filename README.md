@@ -29,6 +29,7 @@ ctscan --help
 | `ctscan save-certs` | Backfill PEM files for hits in DB |
 | `ctscan purge` | Delete jobs/hits (pick one mode) |
 | `ctscan data-dir` | Print default data directory |
+| `ctscan check-br` | BR audit: DNS names must use PSL ICANN DOMAINS (not PRIVATE) |
 
 ---
 
@@ -188,6 +189,54 @@ Each rule has `name` and `filter` (Python). Multiple rules are OR’d; first mat
 
 **Strings:** `matches`, `endswith`, `contains`
 
+**PSL / BR:** `is_br_icann_psl_domain(domain)`, `psl_public_suffix(domain)`, `psl_section(domain)`
+
+---
+
+## BR ICANN PSL domain check
+
+CA/Browser Forum audits often require that certificate **DNS names** are valid on the public Internet using the [Mozilla Public Suffix List](https://publicsuffix.org/list/public_suffix_list.dat). Names whose **public suffix** is listed under **PRIVATE DOMAINS** (e.g. `blogspot.com`, `github.io`, many `*.amazonaws.com` patterns) are flagged — they are not ordinary ICANN registry suffixes.
+
+The list is cached at `~/.ctscan/cache/public_suffix_list.dat` (same official URL as above).
+
+### Check one or more names
+
+```bash
+ctscan check-br -d www.example.com
+ctscan check-br -d foo.blogspot.com    # FAIL — private suffix blogspot.com
+```
+
+### Check a certificate PEM
+
+```bash
+ctscan check-br --pem ./leaf.pem
+```
+
+### Check a CT log entry
+
+```bash
+ctscan check-br \
+  --log-uri "https://ct.googleapis.com/logs/us1/argon2026h1/" \
+  --log-index 12345678
+```
+
+### During scan (drop non-compliant certs)
+
+```bash
+ctscan scan --log-uri "..." \
+  --filter "issuer_org == \"Let's Encrypt\"" \
+  --require-br-icann \
+  --target 20
+```
+
+### As a filter expression
+
+```bash
+ctscan scan --log-uri "..." --filter "is_br_icann_psl_domain(domain)" --target 10
+```
+
+This checks each SAN name being evaluated; use `--require-br-icann` to require **all** DNS names on the certificate to pass.
+
 ---
 
 ## CSV export columns
@@ -212,6 +261,7 @@ Default: `~/.ctscan/` (`ctscan data-dir`)
 |------|----------|
 | `ctscan.db` | SQLite (`scan_jobs`, `matches`) |
 | `cache/all_logs_list.json` | Log list cache |
+| `cache/public_suffix_list.dat` | Mozilla PSL (ICANN vs PRIVATE sections) |
 | `certs/{log_index}.pem` | PEM from `--save-cert` / `save-certs` |
 
 Use `--db` on `scan`, `export`, `jobs`, etc. for a custom database path.

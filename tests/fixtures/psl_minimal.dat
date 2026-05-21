@@ -1,0 +1,10 @@
+// Minimal PSL excerpt for unit tests.
+
+// ===BEGIN ICANN DOMAINS===
+com
+co.uk
+org
+
+// ===BEGIN PRIVATE DOMAINS===
+blogspot.com
+github.io

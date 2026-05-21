@@ -16,6 +16,7 @@ from ctscan.dns.resolver import DnsResolver, normalize_domain
 from ctscan.models import CertRecord
 from ctscan.rules.engine import RuleEngine
 from ctscan.storage.certs_io import default_certs_dir, save_pem_from_record
+from ctscan.psl import get_br_icann_checker
 from ctscan.storage.db import Database
 
 
@@ -37,6 +38,8 @@ class ScanOptions:
     verbose: bool = False
     trust_env: bool = False
     proxy: str | None = None
+    require_br_icann: bool = False
+    """Only accept certs whose DNS names use ICANN PSL suffixes (not PRIVATE)."""
     on_match: Callable[[str, str, int, int], None] | None = None
 
 
@@ -47,6 +50,8 @@ class Scanner:
 
     def run(self, opts: ScanOptions) -> int:
         dns = DnsResolver()
+        br_checker = get_br_icann_checker() if opts.require_br_icann else None
+
         engine: RuleEngine | None = None
         if opts.query or opts.rules_file:
             engine = RuleEngine(
@@ -147,6 +152,19 @@ class Scanner:
                         dns=dns,
                     )
                     if not hit:
+                        continue
+
+                    if br_checker and not br_checker.cert_passes_br_icann(cert):
+                        if opts.verbose:
+                            bad = [
+                                d.name
+                                for d in br_checker.check_cert(cert).domains
+                                if d.br_icann_ok is False
+                            ]
+                            self.console.print(
+                                f"[dim]  skip log_index {cert.log_index}: "
+                                f"BR ICANN PSL failed for {bad}[/]"
+                            )
                         continue
 
                     domain, rule_name = hit
