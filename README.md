@@ -22,6 +22,7 @@ ctscan --help
 | Command | Description |
 |---------|-------------|
 | `ctscan logs` | List CT logs (`--refresh` updates online list and cache) |
+| `ctscan operators` | List CT operators and contact emails from the log list |
 | `ctscan scan` | Scan and write to SQLite |
 | `ctscan jobs` | List scan jobs and hit counts |
 | `ctscan status` | Active job and total hits in DB |
@@ -30,6 +31,9 @@ ctscan --help
 | `ctscan purge` | Delete jobs/hits (pick one mode) |
 | `ctscan data-dir` | Print default data directory |
 | `ctscan check-br` | BR audit: DNS names must use PSL ICANN DOMAINS (not PRIVATE) |
+| `ctscan roots` | List accepted root CAs from `ct/v1/get-roots` |
+| `ctscan check-root` | Check which CT logs include your root CA |
+| `ctscan scts` | Match certificate embedded SCTs to CT operators / logs |
 
 ---
 
@@ -58,7 +62,7 @@ Three prompts: **year → operator → log** (enter a number; Enter defaults to 
 
 - List source may be `live`, `disk_cache` (`~/.ctscan/cache/`), or `builtin`; a message is shown.
 - **Operator** is the CT log **operator** (Google, Cloudflare, …), not the certificate issuer. Filter LE certs with `--query` / `--filter` regardless of operator.
-- Prefer logs marked **✓** and `usable`. **Unknown** at the top often means missing year in cache; prefer **2026/2027**.
+- Prefer logs in **`usable`** state. **`unknown`** often means the log list entry has no `state` field; prefer **2026/2027** logs when scanning.
 - For Google Argon: year **2026** → operator **Google** → **Argon2026h1**.
 
 ### 3. Inspect jobs and export
@@ -239,6 +243,120 @@ This checks each SAN name being evaluated; use `--require-br-icann` to require *
 
 ---
 
+## CT log accepted roots (`get-roots`)
+
+Each CT log publishes the set of **trusted root CAs** it accepts via [RFC 6962](https://datatracker.ietf.org/doc/html/rfc6962) `GET .../ct/v1/get-roots`. Use this to see which logs already include your root and which do not.
+
+### Check your root across all logs
+
+Provide your root CA via **exactly one** of `--pem`, `--der`, or `--fingerprint`:
+
+```bash
+ctscan check-root --pem /path/to/your-root.pem
+ctscan check-root --der /path/to/your-root.der
+ctscan check-root --fingerprint "AA:BB:CC:..."   # SHA-256, colons optional
+```
+
+By default only **usable** logs from the cached log list are checked. Include retired / other states:
+
+```bash
+ctscan check-root --pem ./root.pem --include-all-states
+```
+
+Print only logs that are **missing** your root:
+
+```bash
+ctscan check-root --pem ./root.pem --missing-only
+```
+
+Refresh the online log list before checking:
+
+```bash
+ctscan check-root --pem ./root.pem --refresh
+```
+
+Show operator contact emails (from log list ``operators[].email``) for each log and in the missing summary:
+
+```bash
+ctscan check-root --pem ./root.pem --missing-only --show-contacts
+```
+
+List all operators and emails:
+
+```bash
+ctscan operators
+ctscan operators --refresh
+```
+
+Show contacts inline when listing logs:
+
+```bash
+ctscan logs --contacts
+```
+
+**Output:** a table with `Has root` = `yes` / `no` / `error`, plus a summary list of logs where your root is absent. Exit code **1** if any usable log is missing your root (handy for scripts).
+
+### List roots from one log
+
+```bash
+ctscan roots --log-uri "https://ct.googleapis.com/logs/us1/argon2026h1/"
+```
+
+### List roots from every log in the log list
+
+```bash
+ctscan roots --all-logs
+```
+
+### `check-root` / `roots` options
+
+| Option | Description |
+|--------|-------------|
+| `--pem` | Your root CA certificate (PEM) |
+| `--der` | Your root CA certificate (DER) |
+| `--fingerprint` | SHA-256 fingerprint of your root (hex) |
+| `--usable-only` / `--include-all-states` | Filter by log list state (default: usable only) |
+| `--missing-only` | `check-root` only: hide logs that already have your root |
+| `--show-contacts` | `check-root` only: add operator email column from log list |
+| `--refresh` | Refresh `all_logs_list.json` from gstatic before querying |
+| `--delay` | Seconds between `get-roots` requests (default 0.05) |
+| `--verbose`, `-v` | Print one line per log as each `get-roots` completes |
+| `--proxy` | Explicit proxy URL |
+| `--use-env-proxy` | Use `HTTP_PROXY`/`HTTPS_PROXY` (default: direct) |
+
+Matching compares the full certificate DER (or SHA-256 fingerprint when `--fingerprint` is used).
+
+**Progress:** when checking more than one log, a progress bar shows the current log (`[3/35] Google Argon2026h1 …`). A startup line reports how many logs will be queried. Each `get-roots` uses a **45s read timeout** (not the 180s scan timeout), so unreachable logs fail faster. Use `--verbose` to stream per-log results while the bar runs.
+
+---
+
+## Certificate embedded SCTs (`scts`)
+
+Leaf certificates often carry **Signed Certificate Timestamps** in the X.509 extension `1.3.6.1.4.1.11129.2.4.2` (precert or embedded SCT list). Each SCT contains a `log_id` that identifies the CT log; ctscan matches it against Google's [log list](https://www.gstatic.com/ct/log_list/v3/all_logs_list.json) (classic and tiled logs).
+
+```bash
+ctscan scts --pem ./leaf.pem
+ctscan scts --pem ./leaf.pem --show-contacts
+ctscan scts --pem ./leaf.pem --refresh
+```
+
+**Output:** for each embedded SCT:
+
+| Field | Meaning |
+|-------|---------|
+| SCT time | Timestamp when the log signed the SCT |
+| Operator | CT log operator from the log list |
+| Log | Log description (e.g. Google Argon2026h1) |
+| State | `usable`, `rejected`, `pending`, … |
+| State since | When the log entered that state |
+| Period | Log `temporal_interval` (start ~ end) |
+| Kind | `classic` (RFC 6962) or `tiled` |
+| URL | Log URL or tiled submission/monitoring URL |
+
+Log IDs are listed below the table. Exit code **1** if no SCTs are present or any `log_id` is not found in the cached log list.
+
+---
+
 ## CSV export columns
 
 | Column | Meaning |
@@ -318,7 +436,7 @@ ctscan scan --log-uri "https://ct.googleapis.com/logs/us1/argon2026h1/" ...
 ```
 src/ctscan/
   cli.py
-  ct/           # HTTP client, entry parse, log list
+  ct/           # HTTP client, entry parse, log list, get-roots
   dns/
   rules/
   storage/

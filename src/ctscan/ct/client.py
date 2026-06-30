@@ -9,6 +9,7 @@ import httpx
 
 from ctscan.ct.entry import EntryParseError, extract_certificate_der
 from ctscan.ct.http_util import build_http_client, request_with_retries
+from ctscan.ct.roots import decode_roots_response
 from ctscan.ct.x509_parse import parse_der_certificate
 from ctscan.models import CertRecord
 
@@ -56,6 +57,12 @@ class CtClient:
         url = f"{self.log_uri}ct/v1/get-sth"
         resp = self._get(url)
         return int(resp.json()["tree_size"])
+
+    def get_roots(self) -> list[bytes]:
+        """Return accepted root certificates (DER) from ``ct/v1/get-roots``."""
+        url = f"{self.log_uri}ct/v1/get-roots"
+        resp = self._get(url)
+        return decode_roots_response(resp.json())
 
     def get_entries(self, start: int, end: int) -> list[dict]:
         """Fetch entries in the closed interval [start, end] (RFC 6962)."""

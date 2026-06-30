@@ -13,6 +13,11 @@ def default_ct_timeout() -> httpx.Timeout:
     return httpx.Timeout(connect=30.0, read=180.0, write=30.0, pool=30.0)
 
 
+def default_roots_timeout() -> httpx.Timeout:
+    """Shorter timeouts for small ``get-roots`` JSON responses."""
+    return httpx.Timeout(connect=15.0, read=45.0, write=15.0, pool=15.0)
+
+
 def build_http_client(
     *,
     trust_env: bool = False,

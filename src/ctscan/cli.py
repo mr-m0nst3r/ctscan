@@ -8,14 +8,35 @@ from typing import Optional
 import httpx
 import typer
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.table import Table
 
+from ctscan.ct.client import CtClient
+from ctscan.ct.http_util import default_roots_timeout
 from ctscan.ct.log_list import (
+    fetch_ct_log_index,
     fetch_ct_logs,
+    fetch_ct_operators,
     group_logs_by_operator,
     group_logs_by_year,
+    operator_contact_map,
 )
-from ctscan.ct.client import CtClient
+from ctscan.ct.roots import (
+    cert_sha256_fingerprint,
+    describe_root,
+    load_cert_der,
+    normalize_fingerprint,
+    root_matches,
+)
+from ctscan.ct.sct import extract_scts_from_der, lookup_scts
+from ctscan.ct.x509_parse import parse_der_certificate
 from ctscan.pipeline.scanner import ScanOptions, Scanner
 from ctscan.psl import CertBrCheckResult, get_br_icann_checker
 from ctscan.psl.loader import load_psl
@@ -147,8 +168,7 @@ def _interactive_pick_log() -> str:
 
     console.print("\n[bold]Pick CT log[/]")
     for i, log in enumerate(op_logs, 1):
-        icon = "✓" if log.state == "usable" else "✗"
-        console.print(f"  {i:2d}. [{icon}] {log.description}")
+        console.print(f"  {i:2d}. [{log.state}] {log.description}", markup=False)
 
     choice = typer.prompt("Log number", default="1")
     try:
@@ -166,6 +186,11 @@ def cmd_logs(
     refresh: bool = typer.Option(
         False, "--refresh", help="Force refresh of the online log list cache"
     ),
+    contacts: bool = typer.Option(
+        False,
+        "--contacts",
+        help="Show CT operator contact emails from the log list",
+    ),
 ):
     """List all CT log servers."""
     logs, source = fetch_ct_logs(force_refresh=refresh)
@@ -175,14 +200,58 @@ def cmd_logs(
         console.print("[red]No log list available (network failed and no cache).[/]")
         raise typer.Exit(1)
 
+    contacts_map: dict[str, str] = {}
+    if contacts:
+        operators, op_source = fetch_ct_operators(force_refresh=refresh)
+        contacts_map = operator_contact_map(operators)
+        if op_source in ("builtin", "empty"):
+            console.print(
+                "[yellow]Operator emails unavailable without log list cache.[/] "
+                "Try [cyan]ctscan logs --refresh --contacts[/]\n"
+            )
+
     by_year = group_logs_by_year(logs)
     for year, year_logs in by_year.items():
         console.print(f"\n[bold]=== {year} ===[/]")
         for log in year_logs:
-            icon = "✓" if log.state == "usable" else "✗"
-            console.print(f"  [{icon}] {log.description}")
+            console.print(f"  [{log.state}] {log.description}", markup=False)
             console.print(f"      {log.url}")
-            console.print(f"      {log.start} ~ {log.end} | {log.operator} | {log.state}")
+            line = f"      {log.start} ~ {log.end} | {log.operator}"
+            if contacts:
+                line += f" | {contacts_map.get(log.operator, '—')}"
+            console.print(line)
+
+
+@app.command("operators")
+def cmd_operators(
+    refresh: bool = typer.Option(
+        False, "--refresh", help="Force refresh of the online log list cache"
+    ),
+):
+    """List CT log operators and contact emails from ``all_logs_list.json``."""
+    operators, source = fetch_ct_operators(force_refresh=refresh)
+    if source != "live":
+        console.print(f"[dim]List source: {source}[/]\n")
+    if not operators:
+        console.print("[red]No operator list available.[/]")
+        raise typer.Exit(1)
+    if source in ("builtin", "empty"):
+        console.print(
+            "[yellow]Built-in fallback has no operator emails.[/] "
+            "Run [cyan]ctscan operators --refresh[/] when online.\n"
+        )
+
+    table = Table(title="CT log operators")
+    table.add_column("Operator")
+    table.add_column("Email")
+    table.add_column("Logs", justify="right")
+    logs, _ = fetch_ct_logs(force_refresh=False)
+    counts: dict[str, int] = {}
+    for log in logs:
+        counts[log.operator] = counts.get(log.operator, 0) + 1
+    for op in sorted(operators, key=lambda o: o.name.lower()):
+        table.add_row(op.name, op.contact, str(counts.get(op.name, 0)))
+    console.print(table)
 
 
 @app.command("scan")
@@ -397,6 +466,518 @@ def cmd_check_br(
         raise typer.Exit(1)
 
     raise typer.Exit(exit_code)
+
+
+@app.command("scts")
+def cmd_scts(
+    pem: Path = typer.Option(..., "--pem", help="Certificate PEM or DER file"),
+    refresh: bool = typer.Option(
+        False, "--refresh", help="Refresh the online CT log list cache"
+    ),
+    show_contacts: bool = typer.Option(
+        False,
+        "--show-contacts",
+        help="Include operator contact emails from the log list",
+    ),
+):
+    """
+    Show which CT logs issued the embedded SCTs in a certificate.
+
+    Matches each SCT ``log_id`` against ``all_logs_list.json`` and reports
+    operator, log state, validity period, and URL when known.
+    """
+    der = load_cert_der(pem)
+    cert_info = parse_der_certificate(0, der)
+    console.print(
+        f"Certificate: [cyan]{cert_info.subject_cn}[/] "
+        f"({cert_info.issuer_org})"
+    )
+    console.print(
+        f"Validity: [dim]{cert_info.not_before}[/] → {cert_info.not_after}\n"
+    )
+
+    scts = extract_scts_from_der(der)
+    if not scts:
+        console.print(
+            "[red]No embedded SCTs found[/] in certificate extensions "
+            "(OID 1.3.6.1.4.1.11129.2.4.2)."
+        )
+        raise typer.Exit(1)
+
+    log_index, source = fetch_ct_log_index(force_refresh=refresh)
+    if source != "live":
+        console.print(f"[dim]Log list source: {source}[/]\n")
+    if not log_index:
+        console.print(
+            "[yellow]Log list index unavailable.[/] "
+            "Run [cyan]ctscan scts --pem ... --refresh[/] when online.\n"
+        )
+
+    results = lookup_scts(scts, log_index)
+    unknown = sum(1 for r in results if not r.matched)
+
+    table = Table(title=f"Embedded SCTs ({len(results)})")
+    table.add_column("#", justify="right")
+    table.add_column("SCT time")
+    table.add_column("Operator")
+    if show_contacts:
+        table.add_column("Contact")
+    table.add_column("Log")
+    table.add_column("State")
+    table.add_column("State since")
+    table.add_column("Period")
+    table.add_column("Kind")
+    table.add_column("URL")
+
+    for i, row in enumerate(results, 1):
+        period = "—"
+        if row.period_start != "—" or row.period_end != "—":
+            period = f"{row.period_start} ~ {row.period_end}"
+        cells = [
+            str(i),
+            row.sct.timestamp,
+            row.operator if row.matched else "[unknown]",
+        ]
+        if show_contacts:
+            cells.append(row.operator_contact if row.matched else "—")
+        cells.extend(
+            [
+                row.description if row.matched else "—",
+                row.state if row.matched else "—",
+                row.state_timestamp if row.matched else "—",
+                period if row.matched else "—",
+                row.log_kind if row.matched else "—",
+                _truncate(row.url if row.matched else "—", 48),
+            ]
+        )
+        style = None if row.matched else "red"
+        table.add_row(*cells, style=style)
+
+    console.print(table)
+    console.print("\n[bold]Log IDs[/]")
+    for i, row in enumerate(results, 1):
+        known = "matched" if row.matched else "unknown"
+        console.print(
+            f"  {i}. [{known}] [dim]{row.sct.log_id_b64}[/] "
+            f"({row.sct.extension}, {row.sct.hash_algorithm})"
+        )
+
+    if unknown:
+        console.print(
+            f"\n[yellow]{unknown} SCT(s) not found in log list.[/] "
+            "Try [cyan]--refresh[/] or the log may be outside the cached list."
+        )
+        raise typer.Exit(1)
+
+
+def _resolve_target_root(
+    pem: Path | None,
+    der_path: Path | None,
+    fingerprint: str | None,
+) -> tuple[bytes | None, str]:
+    """Return (root DER or None, normalized SHA-256 fingerprint)."""
+    if sum(p is not None for p in (pem, der_path, fingerprint)) != 1:
+        console.print(
+            "[red]Specify exactly one of:[/] [cyan]--pem[/], [cyan]--der[/], "
+            "or [cyan]--fingerprint[/]"
+        )
+        raise typer.Exit(1)
+
+    if pem is not None:
+        root_der = load_cert_der(pem)
+        return root_der, cert_sha256_fingerprint(root_der)
+    if der_path is not None:
+        root_der = load_cert_der(der_path)
+        return root_der, cert_sha256_fingerprint(root_der)
+    assert fingerprint is not None
+    fp = normalize_fingerprint(fingerprint)
+    if len(fp) != 64:
+        console.print("[red]--fingerprint must be a SHA-256 hex digest (64 hex chars)[/]")
+        raise typer.Exit(1)
+    return None, fp
+
+
+def _log_has_root(
+    roots: list[bytes],
+    target_der: bytes | None,
+    target_fp: str,
+) -> bool:
+    if target_der is not None:
+        return root_matches(target_der, roots)
+    return any(cert_sha256_fingerprint(r) == target_fp for r in roots)
+
+
+def _make_roots_client(
+    log_uri: str,
+    *,
+    use_env_proxy: bool,
+    proxy: str | None,
+) -> CtClient:
+    return CtClient(
+        log_uri,
+        timeout=default_roots_timeout(),
+        trust_env=use_env_proxy and proxy is None,
+        proxy=proxy,
+        retries=2,
+    )
+
+
+def _progress_label(text: str, max_len: int = 48) -> str:
+    return _truncate(text, max_len)
+
+
+@app.command("roots")
+def cmd_roots(
+    log_uri: Optional[str] = typer.Option(
+        None, "--log-uri", help="CT log URL (omit with --all-logs)"
+    ),
+    all_logs: bool = typer.Option(
+        False,
+        "--all-logs",
+        help="Query every log from the cached log list (not just one --log-uri)",
+    ),
+    usable_only: bool = typer.Option(
+        True,
+        "--usable-only/--include-all-states",
+        help="When using --all-logs, skip non-usable logs",
+    ),
+    refresh: bool = typer.Option(
+        False, "--refresh", help="Refresh the online CT log list cache"
+    ),
+    use_env_proxy: bool = typer.Option(False, "--use-env-proxy"),
+    proxy: Optional[str] = typer.Option(None, "--proxy"),
+    delay: float = typer.Option(
+        0.05, "--delay", help="Delay between log requests (seconds)"
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Print one line per log as it is queried"
+    ),
+):
+    """List accepted root certificates from CT log(s) via ``ct/v1/get-roots``."""
+    import time
+
+    if not log_uri and not all_logs:
+        console.print("[red]Specify --log-uri or --all-logs[/]")
+        raise typer.Exit(1)
+    if log_uri and all_logs:
+        console.print("[red]Use either --log-uri or --all-logs, not both[/]")
+        raise typer.Exit(1)
+
+    targets: list[tuple[str, str]] = []
+    if log_uri:
+        targets.append((log_uri.rstrip("/") + "/", "single log"))
+    else:
+        logs, source = fetch_ct_logs(force_refresh=refresh)
+        if source != "live":
+            console.print(f"[dim]Log list source: {source}[/]\n")
+        if not logs:
+            console.print("[red]No CT logs available.[/]")
+            raise typer.Exit(1)
+        for log in logs:
+            if usable_only and log.state != "usable":
+                continue
+            targets.append((log.url.rstrip("/") + "/", log.description))
+
+    total = len(targets)
+    console.print(
+        f"Querying [cyan]ct/v1/get-roots[/] for {total} log(s) "
+        f"(45s read timeout per log)…\n"
+    )
+
+    def _query_one(i: int, uri: str, label: str) -> list[bytes] | None:
+        try:
+            with _make_roots_client(
+                uri, use_env_proxy=use_env_proxy, proxy=proxy
+            ) as ct:
+                return ct.get_roots()
+        except Exception as exc:
+            console.print(f"[red]Failed[/] {_progress_label(label)}: {exc}")
+            return None
+
+    if total > 1:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False,
+        ) as progress:
+            task = progress.add_task("Fetching roots", total=total)
+            for i, (uri, label) in enumerate(targets):
+                progress.update(
+                    task,
+                    description=f"[{i + 1}/{total}] {_progress_label(label)}",
+                )
+                roots = _query_one(i, uri, label)
+                if verbose and roots is not None:
+                    console.print(
+                        f"  [{i + 1}/{total}] {_progress_label(label)} — "
+                        f"{len(roots)} root(s)"
+                    )
+                progress.advance(task)
+                _print_roots_block(i, total, uri, label, roots, delay)
+    else:
+        for i, (uri, label) in enumerate(targets):
+            console.print(f"Fetching [cyan]{uri}[/] …")
+            roots = _query_one(i, uri, label)
+            if verbose and roots is not None:
+                console.print(
+                    f"  [{i + 1}/{total}] {_progress_label(label)} — "
+                    f"{len(roots)} root(s)"
+                )
+            _print_roots_block(i, total, uri, label, roots, delay)
+
+
+def _print_roots_block(
+    i: int,
+    total: int,
+    uri: str,
+    label: str,
+    roots: list[bytes] | None,
+    delay: float,
+) -> None:
+    import time
+
+    if roots is None:
+        if i < total - 1:
+            time.sleep(delay)
+        return
+
+    if total > 1:
+        console.print(f"\n[bold]{label}[/]\n[dim]{uri}[/]")
+    if not roots:
+        console.print("[yellow]No roots returned[/]")
+    else:
+        table = Table()
+        table.add_column("#", justify="right")
+        table.add_column("Subject CN")
+        table.add_column("Subject O")
+        table.add_column("SHA-256")
+        for n, der in enumerate(roots, 1):
+            info = describe_root(der)
+            table.add_row(
+                str(n),
+                info["subject_cn"],
+                info["subject_org"],
+                info["fingerprint_sha256"],
+            )
+        console.print(table)
+        console.print(f"[dim]{len(roots)} root(s)[/]")
+
+    if i < total - 1:
+        time.sleep(delay)
+
+
+@app.command("check-root")
+def cmd_check_root(
+    pem: Optional[Path] = typer.Option(
+        None, "--pem", help="Your root CA certificate (PEM)"
+    ),
+    der_path: Optional[Path] = typer.Option(
+        None, "--der", help="Your root CA certificate (DER)"
+    ),
+    fingerprint: Optional[str] = typer.Option(
+        None,
+        "--fingerprint",
+        help="SHA-256 fingerprint of your root (hex, with or without colons)",
+    ),
+    usable_only: bool = typer.Option(
+        True,
+        "--usable-only/--include-all-states",
+        help="Only check logs marked usable in the log list",
+    ),
+    missing_only: bool = typer.Option(
+        False,
+        "--missing-only",
+        help="Print only logs that do not include your root",
+    ),
+    refresh: bool = typer.Option(
+        False, "--refresh", help="Refresh the online CT log list cache"
+    ),
+    use_env_proxy: bool = typer.Option(False, "--use-env-proxy"),
+    proxy: Optional[str] = typer.Option(None, "--proxy"),
+    delay: float = typer.Option(
+        0.05, "--delay", help="Delay between get-roots requests (seconds)"
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", "-v", help="Print one line per log as it is checked"
+    ),
+    show_contacts: bool = typer.Option(
+        False,
+        "--show-contacts",
+        help="Include operator contact emails from the log list",
+    ),
+):
+    """
+    Check which CT logs accept your root (``ct/v1/get-roots``).
+
+    Reports logs that include your root and logs where it is missing.
+    """
+    import time
+
+    target_der, target_fp = _resolve_target_root(pem, der_path, fingerprint)
+    if target_der is not None:
+        info = describe_root(target_der)
+        console.print(
+            f"Target root: [cyan]{info['subject_cn']}[/] "
+            f"({info['subject_org']})"
+        )
+    console.print(f"SHA-256: [dim]{target_fp}[/]\n")
+
+    logs, source = fetch_ct_logs(force_refresh=refresh)
+    if source != "live":
+        console.print(f"[dim]Log list source: {source}[/]\n")
+    if not logs:
+        console.print("[red]No CT logs available.[/]")
+        raise typer.Exit(1)
+
+    if usable_only:
+        logs = [log for log in logs if log.state == "usable"]
+        if not logs:
+            console.print("[red]No usable logs in list.[/] Try --include-all-states.")
+            raise typer.Exit(1)
+
+    contacts_map: dict[str, str] = {}
+    if show_contacts:
+        operators, op_source = fetch_ct_operators(force_refresh=refresh)
+        contacts_map = operator_contact_map(operators)
+        if op_source in ("builtin", "empty"):
+            console.print(
+                "[yellow]Operator emails unavailable without log list cache.[/] "
+                "Try [cyan]--refresh --show-contacts[/]\n"
+            )
+
+    total = len(logs)
+    console.print(
+        f"Querying [cyan]ct/v1/get-roots[/] for {total} log(s) "
+        f"(45s read timeout per log)…\n"
+    )
+
+    table = Table(title="CT log root coverage")
+    table.add_column("Operator")
+    if show_contacts:
+        table.add_column("Contact")
+    table.add_column("Log")
+    table.add_column("State")
+    table.add_column("Has root")
+    table.add_column("Roots", justify="right")
+    table.add_column("Note")
+
+    present = 0
+    missing: list = []
+    errors: list[str] = []
+
+    progress_ctx: Progress | None = None
+    task = None
+    if total > 1:
+        progress_ctx = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False,
+        )
+
+    def _process_log(i: int, log) -> None:
+        nonlocal present
+        uri = log.url.rstrip("/") + "/"
+        ok = True
+        try:
+            with _make_roots_client(
+                uri, use_env_proxy=use_env_proxy, proxy=proxy
+            ) as ct:
+                roots = ct.get_roots()
+            has = _log_has_root(roots, target_der, target_fp)
+            note = ""
+        except Exception as exc:
+            ok = False
+            has = False
+            roots = []
+            note = str(exc)[:80]
+            errors.append(log.description)
+
+        if ok:
+            if has:
+                present += 1
+                status = "yes"
+            else:
+                missing.append(log)
+                status = "no"
+        else:
+            status = "error"
+
+        if verbose:
+            roots_n = str(len(roots)) if roots or status != "error" else "—"
+            console.print(
+                f"  [{i + 1}/{total}] {_progress_label(log.description)} "
+                f"— {status} ({roots_n} roots)"
+            )
+
+        if missing_only and status == "yes":
+            return
+
+        style = None
+        if status == "yes":
+            style = "green"
+        elif status == "no":
+            style = "red"
+        elif status == "error":
+            style = "yellow"
+
+        row = [log.operator]
+        if show_contacts:
+            row.append(contacts_map.get(log.operator, "—"))
+        row.extend(
+            [
+                log.description,
+                log.state,
+                status,
+                str(len(roots)) if roots or status != "error" else "—",
+                note,
+            ]
+        )
+        table.add_row(*row, style=style)
+
+    if total > 1:
+        with progress_ctx as progress:
+            task = progress.add_task("Checking roots", total=total)
+            for i, log in enumerate(logs):
+                progress.update(
+                    task,
+                    description=(
+                        f"[{i + 1}/{total}] {_progress_label(log.description)}"
+                    ),
+                )
+                _process_log(i, log)
+                progress.advance(task)
+                if i < total - 1:
+                    time.sleep(delay)
+    else:
+        for i, log in enumerate(logs):
+            console.print(f"Checking {_progress_label(log.description)} …")
+            _process_log(i, log)
+            if i < total - 1:
+                time.sleep(delay)
+
+    console.print(table)
+    console.print(
+        f"\n[bold]Summary:[/] {present}/{len(logs)} log(s) include your root."
+    )
+    if missing:
+        console.print(f"[red]Missing ({len(missing)}):[/]")
+        for log in missing:
+            line = f"  · {log.description}"
+            if show_contacts:
+                line += f" — {contacts_map.get(log.operator, '—')}"
+            console.print(line)
+    if errors:
+        console.print(f"[yellow]Errors ({len(errors)}):[/] use --delay or check network")
+
+    raise typer.Exit(1 if missing else 0)
 
 
 @app.command("save-certs")

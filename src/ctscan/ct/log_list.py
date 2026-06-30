@@ -10,7 +10,7 @@ from pathlib import Path
 import httpx
 
 from ctscan.ct.http_util import build_http_client, request_with_retries
-from ctscan.models import CtLogInfo
+from ctscan.models import CtLogInfo, CtLogListEntry, CtOperatorInfo
 from ctscan.storage.db import default_data_dir
 
 CT_LOG_LIST_URL = "https://www.gstatic.com/ct/log_list/v3/all_logs_list.json"
@@ -54,6 +54,96 @@ def _builtin_fallback_logs() -> list[CtLogInfo]:
     ]
 
 
+def parse_operators_from_json(data: dict) -> list[CtOperatorInfo]:
+    """Parse operator names and contact emails from the CT log list JSON."""
+    operators: list[CtOperatorInfo] = []
+    for op in data.get("operators", []):
+        name = op.get("name", "Unknown")
+        raw = op.get("email", [])
+        if isinstance(raw, str):
+            emails = [raw] if raw else []
+        elif isinstance(raw, list):
+            emails = [str(e) for e in raw if e]
+        else:
+            emails = []
+        operators.append(CtOperatorInfo(name=name, emails=emails))
+    return operators
+
+
+def operator_contact_map(operators: list[CtOperatorInfo]) -> dict[str, str]:
+    return {op.name: op.contact for op in operators}
+
+
+def _operator_emails(operator: dict) -> list[str]:
+    raw = operator.get("email", [])
+    if isinstance(raw, str):
+        return [raw] if raw else []
+    if isinstance(raw, list):
+        return [str(e) for e in raw if e]
+    return []
+
+
+def _parse_one_log_entry(
+    operator: dict,
+    log: dict,
+    *,
+    log_kind: str,
+) -> CtLogListEntry | None:
+    log_id = log.get("log_id")
+    if not log_id:
+        return None
+    temporal = log.get("temporal_interval", {})
+    start = temporal.get("start_inclusive", "")
+    end = temporal.get("end_exclusive", "")
+    state = "unknown"
+    state_timestamp = ""
+    state_obj = log.get("state", {})
+    if state_obj:
+        state = next(iter(state_obj.keys()))
+        details = state_obj.get(state) or {}
+        state_timestamp = str(details.get("timestamp", ""))[:19].replace("T", " ")
+    url = (
+        log.get("url")
+        or log.get("submission_url")
+        or log.get("monitoring_url")
+        or ""
+    )
+    mmd = log.get("mmd")
+    return CtLogListEntry(
+        operator=operator.get("name", "Unknown"),
+        operator_emails=_operator_emails(operator),
+        description=log.get("description", "N/A"),
+        log_id=log_id,
+        url=url.rstrip("/") + ("/" if url and not url.endswith("/") else ""),
+        state=state,
+        state_timestamp=state_timestamp,
+        start=start[:10] if start else "N/A",
+        end=end[:10] if end else "N/A",
+        mmd=int(mmd) if mmd is not None else None,
+        log_kind=log_kind,
+        log_type=log.get("log_type"),
+    )
+
+
+def parse_log_entries_from_json(data: dict) -> list[CtLogListEntry]:
+    """Parse classic and tiled logs with ``log_id`` for SCT lookup."""
+    entries: list[CtLogListEntry] = []
+    for operator in data.get("operators", []):
+        for log in operator.get("logs", []):
+            entry = _parse_one_log_entry(operator, log, log_kind="classic")
+            if entry:
+                entries.append(entry)
+        for log in operator.get("tiled_logs", []):
+            entry = _parse_one_log_entry(operator, log, log_kind="tiled")
+            if entry:
+                entries.append(entry)
+    return entries
+
+
+def build_log_id_index(entries: list[CtLogListEntry]) -> dict[str, CtLogListEntry]:
+    return {entry.log_id: entry for entry in entries}
+
+
 def _parse_log_list_json(data: dict) -> list[CtLogInfo]:
     logs: list[CtLogInfo] = []
     for operator in data.get("operators", []):
@@ -80,15 +170,24 @@ def _parse_log_list_json(data: dict) -> list[CtLogInfo]:
     return logs
 
 
-def _load_disk_cache() -> list[CtLogInfo] | None:
+def _load_disk_cache_data() -> dict | None:
     path = _cache_path()
     if not path.is_file():
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _load_disk_cache() -> list[CtLogInfo] | None:
+    data = _load_disk_cache_data()
+    if not data:
+        return None
+    try:
         logs = _parse_log_list_json(data)
         return logs if logs else None
-    except (json.JSONDecodeError, OSError, KeyError):
+    except KeyError:
         return None
 
 
@@ -159,6 +258,82 @@ def fetch_ct_logs(
             _CACHE = (now, logs)
             return logs, "builtin"
         return [], "empty"
+
+
+def fetch_log_list_data(
+    force_refresh: bool = False,
+    *,
+    allow_stale_cache: bool = True,
+    allow_builtin_fallback: bool = True,
+) -> tuple[dict | None, str]:
+    """
+    Return raw ``all_logs_list.json`` and source hint.
+
+    ``data`` is None when only the built-in fallback is available (no operator emails).
+    """
+    global _CACHE
+    now = time.time()
+    if not force_refresh and _CACHE and now - _CACHE[0] < 3600:
+        disk = _load_disk_cache_data()
+        if disk:
+            return disk, "memory_cache"
+
+    if not force_refresh:
+        disk = _load_disk_cache_data()
+        if disk:
+            return disk, "disk_cache"
+
+    try:
+        logs = _fetch_remote_log_list()
+        _CACHE = (now, logs)
+        disk = _load_disk_cache_data()
+        return disk, "live"
+    except Exception:
+        if allow_stale_cache:
+            disk = _load_disk_cache_data()
+            if disk:
+                _CACHE = (now, _parse_log_list_json(disk))
+                return disk, "disk_cache_stale"
+        if allow_builtin_fallback:
+            _CACHE = (now, _builtin_fallback_logs())
+            return None, "builtin"
+        return None, "empty"
+
+
+def fetch_ct_operators(
+    force_refresh: bool = False,
+    *,
+    allow_stale_cache: bool = True,
+    allow_builtin_fallback: bool = True,
+) -> tuple[list[CtOperatorInfo], str]:
+    data, source = fetch_log_list_data(
+        force_refresh,
+        allow_stale_cache=allow_stale_cache,
+        allow_builtin_fallback=allow_builtin_fallback,
+    )
+    if data:
+        return parse_operators_from_json(data), source
+    if source == "builtin":
+        names = sorted({log.operator for log in _builtin_fallback_logs()})
+        return [CtOperatorInfo(name=n) for n in names], source
+    return [], source
+
+
+def fetch_ct_log_index(
+    force_refresh: bool = False,
+    *,
+    allow_stale_cache: bool = True,
+    allow_builtin_fallback: bool = True,
+) -> tuple[dict[str, CtLogListEntry], str]:
+    """Return ``log_id`` → log metadata index from the cached log list."""
+    data, source = fetch_log_list_data(
+        force_refresh,
+        allow_stale_cache=allow_stale_cache,
+        allow_builtin_fallback=allow_builtin_fallback,
+    )
+    if data:
+        return build_log_id_index(parse_log_entries_from_json(data)), source
+    return {}, source
 
 
 def group_logs_by_year(logs: list[CtLogInfo]) -> dict[str, list[CtLogInfo]]:
