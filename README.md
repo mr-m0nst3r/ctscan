@@ -28,6 +28,8 @@ ctscan --help
 | `ctscan status` | Active job and total hits in DB |
 | `ctscan export` | Export hits to CSV |
 | `ctscan save-certs` | Backfill PEM files for hits in DB |
+| `ctscan dump-entries` | Download raw `ct/v1/get-entries` JSON (no cert parsing) |
+| `ctscan parse-dump` | Parse a dump JSONL and extract timestamp + leaf cert fields |
 | `ctscan purge` | Delete jobs/hits (pick one mode) |
 | `ctscan data-dir` | Print default data directory |
 | `ctscan check-br` | BR audit: DNS names must use PSL ICANN DOMAINS (not PRIVATE) |
@@ -125,6 +127,62 @@ ctscan purge --all --yes         # wipe database
 ```
 
 ---
+
+## Raw CT entries (`dump-entries` / `parse-dump`)
+
+If you want to do your own offline analysis, you can download raw `ct/v1/get-entries`
+responses **without parsing certificates**, then post-process the dump locally.
+
+### Download a range (print head, then prompt for start/end)
+
+```bash
+ctscan dump-entries \
+  --log-uri "https://ct.googleapis.com/logs/us1/argon2026h1/" \
+  -o argon.jsonl
+```
+
+The first line of the output file is metadata; subsequent lines are per-entry objects:
+
+```json
+{"type":"ctscan_dump_entries", ...}
+{"index":123,"entry":{"leaf_input":"...","extra_data":"..."}}
+...
+```
+
+### Download a fixed range (script-friendly)
+
+```bash
+ctscan dump-entries \
+  --log-uri "https://ct.googleapis.com/logs/us1/argon2026h1/" \
+  --start 1000000 --end 1001999 \
+  --batch-size 200 \
+  -o argon_1000000_1001999.jsonl
+```
+
+### Parse the dump to JSONL/CSV (timestamp + leaf certificate fields)
+
+```bash
+# JSONL rows
+ctscan parse-dump -i argon.jsonl -o parsed.jsonl
+
+# CSV rows
+ctscan parse-dump -i argon.jsonl --csv parsed.csv
+```
+
+Each parsed row includes:
+
+- `timestamp_ms`, `timestamp_utc` (CT log entry timestamp)
+- `issuer_cn`, `issuer_org`, `subject_cn`, `subject_org`
+- `not_before`, `not_after`
+- `domain` (first SAN) and `san` (all SANs; CSV uses `;` separator)
+- `cert_der_b64` (leaf certificate DER, base64)
+
+### Export leaf certificate DER files
+
+```bash
+ctscan parse-dump -i argon.jsonl --export-der-dir ./ders
+openssl x509 -inform DER -in ./ders/123.der -noout -text
+```
 
 ## `scan` options
 
