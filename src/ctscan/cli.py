@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import base64
+import csv
+from datetime import date
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -21,12 +26,14 @@ from rich.table import Table
 from ctscan.ct.client import CtClient
 from ctscan.ct.http_util import default_roots_timeout
 from ctscan.ct.log_list import (
-    fetch_ct_log_index,
     fetch_ct_logs,
+    fetch_ct_log_index,
     fetch_ct_operators,
     group_logs_by_operator,
     group_logs_by_year,
     operator_contact_map,
+    parse_iso_date,
+    select_logs_for_interval,
 )
 from ctscan.ct.roots import (
     cert_sha256_fingerprint,
@@ -37,6 +44,11 @@ from ctscan.ct.roots import (
 )
 from ctscan.ct.sct import extract_scts_from_der, lookup_scts
 from ctscan.ct.x509_parse import parse_der_certificate
+from ctscan.pipeline.interval_scan import (
+    IntervalScanCoordinator,
+    ScanLogTarget,
+    group_targets_by_operator,
+)
 from ctscan.pipeline.scanner import ScanOptions, Scanner
 from ctscan.psl import CertBrCheckResult, get_br_icann_checker
 from ctscan.psl.loader import load_psl
@@ -54,6 +66,29 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
+
+
+def _iter_entry_ranges(start: int, end: int, batch_size: int) -> list[tuple[int, int]]:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
+    if start < 0 or end < start:
+        raise ValueError("invalid range")
+    ranges: list[tuple[int, int]] = []
+    cur = start
+    while cur <= end:
+        r_end = min(end, cur + batch_size - 1)
+        ranges.append((cur, r_end))
+        cur = r_end + 1
+    return ranges
+
+
+def _parse_ct_leaf_timestamp_ms(leaf_input: bytes) -> int:
+    """
+    RFC 6962 MerkleTreeLeaf: timestamp is 8 bytes at offset 2..10 (ms since epoch).
+    """
+    if len(leaf_input) < 10:
+        raise ValueError("leaf_input too short for timestamp")
+    return int.from_bytes(leaf_input[2:10], "big")
 
 
 def _print_cert_br_check(result: CertBrCheckResult) -> None:
@@ -93,13 +128,112 @@ def _print_cert_br_check(result: CertBrCheckResult) -> None:
     console.print(table)
 
 
-def _resolve_log_uri(log_uri: str | None, pick: bool) -> str:
-    if log_uri:
-        return log_uri.rstrip("/") + "/"
-    if not pick:
-        console.print("[red]Specify --log-uri or use --pick to choose interactively[/]")
+def _parse_scan_date(label: str, value: str) -> date:
+    parsed = parse_iso_date(value.strip())
+    if parsed is None:
+        console.print(f"[red]Invalid {label} date:[/] {value!r} (use YYYY-MM-DD)")
         raise typer.Exit(1)
-    return _interactive_pick_log()
+    return parsed
+
+
+def _resolve_scan_log_uris(
+    *,
+    log_uri: str | None,
+    pick: bool,
+    from_date: str | None,
+    to_date: str | None,
+    usable_only: bool,
+    refresh: bool,
+) -> list[ScanLogTarget]:
+    """
+    Return CT logs to scan for this invocation.
+    """
+    if log_uri:
+        if from_date or to_date:
+            console.print("[red]Use either --log-uri or --from/--to, not both[/]")
+            raise typer.Exit(1)
+        if pick:
+            console.print("[red]Use either --log-uri or --pick, not both[/]")
+            raise typer.Exit(1)
+        uri = log_uri.rstrip("/") + "/"
+        return [ScanLogTarget(uri=uri, label="single log", operator="manual")]
+
+    if pick:
+        if from_date or to_date:
+            console.print("[red]Use either --pick or --from/--to, not both[/]")
+            raise typer.Exit(1)
+        uri = _interactive_pick_log()
+        operator = "manual"
+        logs, _ = fetch_ct_logs()
+        for log in logs:
+            if log.url.rstrip("/") + "/" == uri:
+                operator = log.operator
+                break
+        return [ScanLogTarget(uri=uri, label="picked log", operator=operator)]
+
+    if not from_date and not to_date:
+        console.print(
+            "[red]Specify --log-uri, --pick, or a time interval (--from / --to)[/]"
+        )
+        raise typer.Exit(1)
+
+    start = _parse_scan_date("--from", from_date) if from_date else date(2013, 1, 1)
+    end = _parse_scan_date("--to", to_date) if to_date else date.today()
+    if start > end:
+        console.print("[red]--from must be on or before --to[/]")
+        raise typer.Exit(1)
+
+    logs, source = fetch_ct_logs(force_refresh=refresh)
+    if source in ("disk_cache", "memory_cache"):
+        console.print("[dim]Using cached log list for interval match[/]")
+    elif source == "disk_cache_stale":
+        console.print(
+            "[yellow]Cannot reach gstatic; using stale local cache for interval match.[/]"
+        )
+    elif source == "builtin":
+        console.print(
+            "[yellow]Cannot reach gstatic; interval match uses built-in common logs.[/]"
+        )
+    elif source == "empty":
+        console.print("[red]No log list available to resolve --from/--to.[/]")
+        raise typer.Exit(1)
+
+    try:
+        matched = select_logs_for_interval(
+            logs, start, end, usable_only=usable_only
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1) from exc
+
+    if not matched:
+        scope = "usable " if usable_only else ""
+        console.print(
+            f"[red]No {scope}logs overlap {start} … {end}.[/] "
+            "Try --include-all-states or widen the interval."
+        )
+        raise typer.Exit(1)
+
+    console.print(
+        f"Interval [cyan]{start}[/] … [cyan]{end}[/] → "
+        f"[bold]{len(matched)}[/] log(s):"
+    )
+    for log in matched:
+        console.print(
+            f"  [{log.state}] {log.description} ({log.start} ~ {log.end})",
+            markup=False,
+        )
+    console.print()
+
+    return [
+        ScanLogTarget(
+            uri=log.url.rstrip("/") + "/",
+            label=log.description,
+            operator=log.operator,
+        )
+        for log in matched
+        if log.url
+    ]
 
 
 def _prompt_log_uri_manual() -> str:
@@ -308,13 +442,53 @@ def cmd_scan(
     db_path: Optional[Path] = typer.Option(
         None, "--db", help="SQLite path (default ~/.ctscan/ctscan.db)"
     ),
+    from_date: Optional[str] = typer.Option(
+        None,
+        "--from",
+        help="Interval start (YYYY-MM-DD); auto-select CT logs overlapping this range",
+    ),
+    to_date: Optional[str] = typer.Option(
+        None,
+        "--to",
+        help="Interval end (YYYY-MM-DD, inclusive); default today when --from is set",
+    ),
+    refresh: bool = typer.Option(
+        False,
+        "--refresh",
+        help="Refresh log list before resolving --from/--to",
+    ),
+    usable_only: bool = typer.Option(
+        True,
+        "--usable-only/--include-all-states",
+        help="When using --from/--to, only scan logs in usable state",
+    ),
+    concurrency: Optional[int] = typer.Option(
+        None,
+        "--concurrency",
+        "-j",
+        help="Max parallel CT operators for interval scan (default: all operators)",
+    ),
 ):
-    """Scan a CT log and write matches to SQLite."""
+    """Scan CT log(s) and write matches to SQLite."""
     if query and filter_expr:
         console.print("[red]Cannot use both --query and --filter[/]")
         raise typer.Exit(1)
 
-    uri = _resolve_log_uri(log_uri, pick)
+    interval_from: str | None = None
+    interval_to: str | None = None
+    if from_date or to_date:
+        interval_from = from_date or "2013-01-01"
+        interval_to = to_date or date.today().isoformat()
+
+    log_targets = _resolve_scan_log_uris(
+        log_uri=log_uri,
+        pick=pick,
+        from_date=from_date,
+        to_date=to_date,
+        usable_only=usable_only,
+        refresh=refresh,
+    )
+    multi_log = len(log_targets) > 1
 
     rule_expr: str | None = None
     job_query: str | None = None
@@ -343,26 +517,91 @@ def cmd_scan(
 
     db = Database(db_path) if db_path else Database()
     try:
-        scanner = Scanner(db=db, console=console)
-        scanner.run(
-            ScanOptions(
-                log_uri=uri,
-                target_count=target,
-                batch_size=batch_size,
-                delay=delay,
-                query=rule_expr,
-                job_query=job_query,
-                rules_file=str(rules) if rules else None,
-                nxdomain_mode=nxdomain,
-                after_date=after_date,
-                save_cert=save_cert,
-                resume=not no_resume,
-                verbose=verbose,
-                trust_env=use_env_proxy and proxy is None,
-                proxy=proxy,
-                require_br_icann=require_br_icann,
-            )
+        base_opts = ScanOptions(
+            log_uri="",
+            target_count=target,
+            batch_size=batch_size,
+            delay=delay,
+            query=rule_expr,
+            job_query=job_query,
+            rules_file=str(rules) if rules else None,
+            nxdomain_mode=nxdomain,
+            after_date=after_date,
+            save_cert=save_cert,
+            resume=not no_resume,
+            verbose=verbose,
+            trust_env=use_env_proxy and proxy is None,
+            proxy=proxy,
+            require_br_icann=require_br_icann,
         )
+
+        if multi_log and interval_from and interval_to:
+            session_id: int
+            global_known: set[str]
+            if not no_resume:
+                row = db.find_running_session(
+                    interval_from,
+                    interval_to,
+                    job_query,
+                    nxdomain,
+                )
+                if row:
+                    session_id = int(row["id"])
+                    global_known = db.known_domains_for_session(session_id)
+                    console.print(
+                        f"[cyan]Resuming session #{session_id}[/] "
+                        f"({len(global_known)} unique hits so far)\n"
+                    )
+                else:
+                    session_id = db.create_session(
+                        interval_from,
+                        interval_to,
+                        target,
+                        job_query,
+                        nxdomain,
+                    )
+                    global_known = set()
+            else:
+                session_id = db.create_session(
+                    interval_from,
+                    interval_to,
+                    target,
+                    job_query,
+                    nxdomain,
+                )
+                global_known = set()
+
+            by_operator = group_targets_by_operator(log_targets)
+            coordinator = IntervalScanCoordinator(
+                db,
+                console,
+                session_id=session_id,
+                global_target=target,
+                global_known=global_known,
+            )
+            coordinator.run(by_operator, base_opts, concurrency)
+        else:
+            target_log = log_targets[0]
+            scanner = Scanner(db=db, console=console)
+            scanner.run(
+                ScanOptions(
+                    log_uri=target_log.uri,
+                    target_count=target,
+                    batch_size=batch_size,
+                    delay=delay,
+                    query=rule_expr,
+                    job_query=job_query,
+                    rules_file=str(rules) if rules else None,
+                    nxdomain_mode=nxdomain,
+                    after_date=after_date,
+                    save_cert=save_cert,
+                    resume=not no_resume,
+                    verbose=verbose,
+                    trust_env=use_env_proxy and proxy is None,
+                    proxy=proxy,
+                    require_br_icann=require_br_icann,
+                )
+            )
     except SystemExit:
         raise typer.Exit(1)
     finally:
@@ -1069,6 +1308,271 @@ def cmd_save_certs(
         )
     finally:
         db.close()
+
+
+@app.command("dump-entries")
+def cmd_dump_entries(
+    log_uri: str = typer.Option(..., "--log-uri", help="CT log URL"),
+    output: Path = typer.Option(
+        Path("ct_entries.jsonl"),
+        "--output",
+        "-o",
+        help="Output JSONL path",
+    ),
+    start: Optional[int] = typer.Option(
+        None, "--start", help="Start log index (inclusive)"
+    ),
+    end: Optional[int] = typer.Option(None, "--end", help="End log index (inclusive)"),
+    batch_size: int = typer.Option(
+        200, "--batch-size", help="Entries per get-entries request"
+    ),
+    use_env_proxy: bool = typer.Option(
+        False,
+        "--use-env-proxy",
+        help="Use HTTP_PROXY/HTTPS_PROXY from environment (default: direct)",
+    ),
+    proxy: Optional[str] = typer.Option(
+        None, "--proxy", help="Explicit proxy URL (overrides environment)"
+    ),
+):
+    """
+    Download raw ``ct/v1/get-entries`` JSON for a log index range (no cert parsing).
+
+    Prints current head (tree_size), then prompts for start/end if omitted.
+    Writes one JSON object per line (JSONL): {"index": i, "entry": {...}}.
+    """
+    from ctscan.ct.http_util import format_connect_error_hint
+
+    uri = log_uri.rstrip("/") + "/"
+    with CtClient(uri, trust_env=use_env_proxy and proxy is None, proxy=proxy) as ct:
+        try:
+            tree_size = ct.get_tree_size()
+        except httpx.HTTPError as exc:
+            console.print(format_connect_error_hint(exc))
+            raise typer.Exit(1) from exc
+
+        head = max(0, tree_size - 1)
+        console.print(f"CT log head: tree_size={tree_size:,} (max index {head:,})")
+
+        if start is None:
+            start = int(typer.prompt("Start index (inclusive)", default="0"))
+        if end is None:
+            end = int(typer.prompt("End index (inclusive)", default=str(head)))
+
+        if start < 0 or end < start:
+            console.print(f"[red]Invalid range:[/] {start}..{end}")
+            raise typer.Exit(1)
+        if tree_size > 0 and end > head:
+            console.print(
+                f"[red]End index out of range:[/] {end} (max {head})"
+            )
+            raise typer.Exit(1)
+
+        try:
+            ranges = _iter_entry_ranges(start, end, batch_size)
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/]")
+            raise typer.Exit(1) from exc
+
+        output.parent.mkdir(parents=True, exist_ok=True)
+        total = end - start + 1
+        console.print(
+            f"Downloading {total:,} entries → [cyan]{output.resolve()}[/] "
+            f"({len(ranges)} request(s))\n"
+        )
+
+        written = 0
+        with output.open("w", encoding="utf-8") as f:
+            meta = {
+                "type": "ctscan_dump_entries",
+                "log_uri": uri,
+                "tree_size": tree_size,
+                "start": start,
+                "end": end,
+                "batch_size": batch_size,
+            }
+            f.write(json.dumps(meta, ensure_ascii=False) + "\n")
+
+            for r_start, r_end in ranges:
+                entries = ct.get_entries(r_start, r_end)
+                if not entries:
+                    console.print(
+                        f"[yellow]Warning:[/] empty get-entries {r_start}..{r_end}"
+                    )
+                for i, entry in enumerate(entries):
+                    idx = r_start + i
+                    f.write(
+                        json.dumps({"index": idx, "entry": entry}, ensure_ascii=False)
+                        + "\n"
+                    )
+                    written += 1
+
+        console.print(f"[green]Done.[/] wrote {written:,} JSONL line(s)")
+
+
+@app.command("parse-dump")
+def cmd_parse_dump(
+    input_path: Path = typer.Option(..., "--input", "-i", help="Input JSONL from dump-entries"),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Write extracted rows to JSONL (default: stdout)",
+    ),
+    csv_output: Optional[Path] = typer.Option(
+        None,
+        "--csv",
+        help="Write extracted rows to CSV (mutually exclusive with --output and stdout)",
+    ),
+    export_der_dir: Optional[Path] = typer.Option(
+        None,
+        "--export-der-dir",
+        help="Export leaf certificate DER files to this directory (named <index>.der)",
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", help="Stop after N parsed entries"
+    ),
+):
+    """
+    Parse a dump-entries JSONL and extract:
+
+    - CT timestamp (ms / ISO)
+    - leaf certificate DER (base64)
+
+    Writes JSONL rows:
+      {"index": 123, "timestamp_ms": 0, "timestamp_utc": "...", "cert_der_b64": "...", ...}
+    """
+    from ctscan.ct.entry import extract_certificate_der
+
+    if not input_path.is_file():
+        console.print(f"[red]Input not found:[/] {input_path}")
+        raise typer.Exit(1)
+
+    if csv_output and output:
+        console.print("[red]Use either --csv or --output, not both[/]")
+        raise typer.Exit(1)
+
+    if export_der_dir:
+        export_der_dir.mkdir(parents=True, exist_ok=True)
+
+    out_f = None
+    csv_f = None
+    csv_writer = None
+    try:
+        out_f = (output.open("w", encoding="utf-8") if output else None)
+        csv_f = (csv_output.open("w", encoding="utf-8", newline="") if csv_output else None)
+        if csv_f:
+            csv_writer = csv.DictWriter(
+                csv_f,
+                fieldnames=[
+                    "index",
+                    "timestamp_ms",
+                    "timestamp_utc",
+                    "issuer_cn",
+                    "issuer_org",
+                    "subject_cn",
+                    "subject_org",
+                    "not_before",
+                    "not_after",
+                    "domain",
+                    "san",
+                    "cert_der_b64",
+                ],
+            )
+            csv_writer.writeheader()
+        written = 0
+
+        with input_path.open("r", encoding="utf-8") as f:
+            first = f.readline()
+            if not first:
+                console.print("[red]Empty input file[/]")
+                raise typer.Exit(1)
+            try:
+                meta = json.loads(first)
+            except json.JSONDecodeError:
+                meta = {}
+
+            # If the first line looks like an entry row, treat it as such.
+            pending_first_line = None
+            if "type" in meta and meta.get("type") == "ctscan_dump_entries":
+                pass
+            else:
+                pending_first_line = first
+
+            def emit(row: dict) -> None:
+                nonlocal written
+                if csv_writer is not None:
+                    csv_writer.writerow(row)
+                else:
+                    line = json.dumps(row, ensure_ascii=False)
+                    if out_f:
+                        out_f.write(line + "\n")
+                    else:
+                        console.print(line, markup=False)
+                written += 1
+
+            def handle_line(line: str) -> None:
+                if not line.strip():
+                    return
+                obj = json.loads(line)
+                idx = int(obj["index"])
+                entry = obj["entry"]
+                leaf_b = base64.b64decode(entry["leaf_input"])
+                extra_b = base64.b64decode(entry.get("extra_data") or "")
+                ts_ms = _parse_ct_leaf_timestamp_ms(leaf_b)
+                ts_iso = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat()
+                der = extract_certificate_der(leaf_b, extra_b)
+                der_b64 = base64.b64encode(der).decode("ascii")
+                cert = parse_der_certificate(idx, der)
+                domain = cert.san[0] if cert.san else ""
+                san_s = cert.san
+
+                if export_der_dir:
+                    (export_der_dir / f"{idx}.der").write_bytes(der)
+
+                emit(
+                    {
+                        "index": idx,
+                        "timestamp_ms": ts_ms,
+                        "timestamp_utc": ts_iso,
+                        "issuer_cn": cert.issuer_cn,
+                        "issuer_org": cert.issuer_org,
+                        "subject_cn": cert.subject_cn,
+                        "subject_org": cert.subject_org,
+                        "not_before": cert.not_before,
+                        "not_after": cert.not_after,
+                        "domain": domain,
+                        "san": ";".join(san_s) if csv_writer is not None else san_s,
+                        "cert_der_b64": der_b64,
+                    }
+                )
+
+            if pending_first_line is not None:
+                handle_line(pending_first_line)
+
+            for line in f:
+                if limit is not None and written >= limit:
+                    break
+                try:
+                    handle_line(line)
+                except Exception as exc:
+                    console.print(f"[yellow]Skip line (parse error):[/] {exc}")
+
+        if csv_output:
+            console.print(
+                f"[green]Done.[/] wrote {written} row(s) → [cyan]{csv_output.resolve()}[/]"
+            )
+        elif output:
+            console.print(
+                f"[green]Done.[/] wrote {written} row(s) → [cyan]{output.resolve()}[/]"
+            )
+        else:
+            console.print(f"[dim]Done. wrote {written} row(s).[/]")
+    finally:
+        if out_f:
+            out_f.close()
+        if csv_f:
+            csv_f.close()
 
 
 @app.command("status")

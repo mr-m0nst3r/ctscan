@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,12 +42,41 @@ class ScanOptions:
     require_br_icann: bool = False
     """Only accept certs whose DNS names use ICANN PSL suffixes (not PRIVATE)."""
     on_match: Callable[[str, str, int, int], None] | None = None
+    session_id: int | None = None
+    global_known: set[str] | None = None
+    global_lock: threading.Lock | None = None
+    stop_event: threading.Event | None = None
+    global_target: int | None = None
+    operator_label: str | None = None
+    log_label: str | None = None
+    quiet_done: bool = False
+    print_lock: threading.Lock | None = None
 
 
 class Scanner:
     def __init__(self, db: Database | None = None, console: Console | None = None):
         self.db = db or Database()
         self.console = console or Console()
+
+    def _print(self, opts: ScanOptions, message: str) -> None:
+        lock = opts.print_lock
+        if lock:
+            with lock:
+                self.console.print(message)
+        else:
+            self.console.print(message)
+
+    def _global_mode(self, opts: ScanOptions) -> bool:
+        return opts.global_known is not None and opts.global_target is not None
+
+    def _should_continue(self, opts: ScanOptions, matched: int) -> bool:
+        if opts.stop_event and opts.stop_event.is_set():
+            return False
+        if self._global_mode(opts):
+            assert opts.global_known is not None
+            assert opts.global_target is not None
+            return len(opts.global_known) < opts.global_target
+        return matched < opts.target_count
 
     def run(self, opts: ScanOptions) -> int:
         dns = DnsResolver()
@@ -64,14 +94,16 @@ class Scanner:
         saved_pems = 0
         if opts.save_cert:
             certs_dir.mkdir(parents=True, exist_ok=True)
-            self.console.print(
-                f"[dim]--save-cert[/] will write PEMs to [cyan]{certs_dir.resolve()}[/]"
-            )
+            if not self._global_mode(opts):
+                self.console.print(
+                    f"[dim]--save-cert[/] will write PEMs to [cyan]{certs_dir.resolve()}[/]"
+                )
 
         job_id: int
         next_end: int
         known: set[str]
         matched = 0
+        global_mode = self._global_mode(opts)
 
         with CtClient(
             opts.log_uri,
@@ -81,40 +113,56 @@ class Scanner:
             try:
                 tree_size = ct.get_tree_size()
             except httpx.HTTPError as exc:
-                self.console.print(format_connect_error_hint(exc))
+                self._print(opts, format_connect_error_hint(exc))
                 raise SystemExit(1) from exc
 
             if opts.resume:
-                row = self.db.get_active_job()
-                if row and row["log_uri"] == opts.log_uri and row["status"] == "running":
+                row = self.db.get_running_job_for_log(opts.log_uri, opts.session_id)
+                if row and row["status"] == "running":
                     job_id = int(row["id"])
                     next_end = int(row["next_end_index"])
                     matched = int(row["matched_count"])
                     known = self.db.known_domains(job_id)
-                    self.console.print(
+                    if global_mode and opts.global_known is not None:
+                        known |= opts.global_known
+                    self._print(
+                        opts,
                         f"[cyan]Resuming job #{job_id}[/] "
-                        f"({matched} hits so far), from index {next_end}"
+                        f"({matched} log hits), from index {next_end}",
                     )
                 else:
                     job_id, next_end, known, matched = self._new_job(
-                        opts, tree_size
+                        opts, tree_size, global_mode
                     )
             else:
-                job_id, next_end, known, matched = self._new_job(opts, tree_size)
+                job_id, next_end, known, matched = self._new_job(
+                    opts, tree_size, global_mode
+                )
 
-            self.console.print(
-                f"CT log size: {tree_size:,}, target hits: {opts.target_count}"
+            target_label = (
+                str(opts.global_target)
+                if global_mode and opts.global_target is not None
+                else str(opts.target_count)
             )
-            self.console.print(
+            prefix = ""
+            if opts.operator_label:
+                prefix = f"{opts.operator_label}: "
+            self._print(
+                opts,
+                f"{prefix}CT log size: {tree_size:,}, "
+                f"target unique hits: {target_label}",
+            )
+            self._print(
+                opts,
                 "[dim]Scanning backward from the log tail; the first get-entries "
-                "call may take tens of seconds to minutes on large logs.[/]"
+                "call may take tens of seconds to minutes on large logs.[/]",
             )
 
             checked = 0
             batches = 0
             last_progress = time.monotonic()
 
-            while matched < opts.target_count and next_end >= 0:
+            while self._should_continue(opts, matched) and next_end >= 0:
                 batch_start = max(0, next_end - opts.batch_size + 1)
                 batches += 1
 
@@ -122,15 +170,16 @@ class Scanner:
                     f"[dim]Batch {batches} · get-entries "
                     f"{batch_start:,} … {next_end:,}[/]"
                 )
-                self.console.print(fetch_msg)
+                self._print(opts, fetch_msg)
 
                 raw = ct.get_entries(batch_start, next_end)
 
                 if not raw:
-                    self.console.print(
+                    self._print(
+                        opts,
                         f"[yellow]Warning:[/] batch returned 0 entries "
                         f"({batch_start:,} … {next_end:,}); "
-                        "rate limit or invalid range — continuing."
+                        "rate limit or invalid range — continuing.",
                     )
 
                 certs: list[CertRecord] = []
@@ -168,36 +217,77 @@ class Scanner:
                         continue
 
                     domain, rule_name = hit
-                    if self.db.add_match(
-                        job_id,
-                        cert.log_index,
-                        domain,
-                        cert.issuer_cn,
-                        cert.issuer_org,
-                        cert.not_before,
-                        cert.not_after,
-                        rule_name,
-                    ):
-                        matched += 1
-                        known.add(normalize_domain(domain))
-                        label = f"[{matched}/{opts.target_count}] {domain}"
+                    clean = normalize_domain(domain)
+
+                    if global_mode and opts.global_known is not None and opts.global_lock:
+                        with opts.global_lock:
+                            if clean in opts.global_known:
+                                continue
+                            inserted = self.db.add_match(
+                                job_id,
+                                cert.log_index,
+                                domain,
+                                cert.issuer_cn,
+                                cert.issuer_org,
+                                cert.not_before,
+                                cert.not_after,
+                                rule_name,
+                            )
+                            if not inserted:
+                                continue
+                            opts.global_known.add(clean)
+                            matched += 1
+                            known.add(clean)
+                            global_count = len(opts.global_known)
+                        label = f"[{global_count}/{opts.global_target}] {domain}"
                         if opts.on_match:
-                            opts.on_match(label, rule_name, cert.log_index, matched)
+                            opts.on_match(
+                                label, rule_name, cert.log_index, global_count
+                            )
                         else:
-                            self.console.print(f"{label} ({rule_name})")
-
-                        if opts.save_cert:
-                            if save_pem_from_record(cert, certs_dir):
-                                saved_pems += 1
-                                self.console.print(
-                                    f"[dim]  └ saved {cert.log_index}.pem[/]"
+                            self._print(opts, f"{label} ({rule_name})")
+                        if (
+                            opts.global_target is not None
+                            and global_count >= opts.global_target
+                            and opts.stop_event
+                        ):
+                            opts.stop_event.set()
+                    else:
+                        if self.db.add_match(
+                            job_id,
+                            cert.log_index,
+                            domain,
+                            cert.issuer_cn,
+                            cert.issuer_org,
+                            cert.not_before,
+                            cert.not_after,
+                            rule_name,
+                        ):
+                            matched += 1
+                            known.add(clean)
+                            label = f"[{matched}/{opts.target_count}] {domain}"
+                            if opts.on_match:
+                                opts.on_match(
+                                    label, rule_name, cert.log_index, matched
                                 )
-                            elif cert.der is None:
-                                self.console.print(
-                                    "[yellow]  └ cannot save PEM: no certificate DER[/]"
-                                )
+                            else:
+                                self._print(opts, f"{label} ({rule_name})")
+                        else:
+                            continue
 
-                    if matched >= opts.target_count:
+                    if opts.save_cert:
+                        if save_pem_from_record(cert, certs_dir):
+                            saved_pems += 1
+                            self._print(
+                                opts, f"[dim]  └ saved {cert.log_index}.pem[/]"
+                            )
+                        elif cert.der is None:
+                            self._print(
+                                opts,
+                                "[yellow]  └ cannot save PEM: no certificate DER[/]",
+                            )
+
+                    if not self._should_continue(opts, matched):
                         break
 
                 checked += len(certs)
@@ -211,40 +301,59 @@ class Scanner:
                     if tree_size > 0:
                         pos_pct = batch_start / tree_size * 100.0
                         pos_s = f" · ~{pos_pct:.6f}% through log"
-                    self.console.print(
+                    hit_s = str(matched)
+                    if global_mode and opts.global_known is not None:
+                        hit_s = f"{len(opts.global_known)} unique / {matched} log"
+                    self._print(
+                        opts,
                         f"[dim]  └ received {len(raw)} · parsed {len(certs)} certs · "
                         f"unparsed {skipped_leaf} · "
-                        f"total parsed {checked} · hits {matched}{pos_s}[/]"
+                        f"total parsed {checked} · hits {hit_s}{pos_s}[/]",
                     )
 
-                if matched >= opts.target_count:
+                if not self._should_continue(opts, matched):
                     break
 
                 time.sleep(opts.delay)
 
             self.db.complete_job(job_id)
 
-        self.console.print(
-            f"[green]Done.[/] {matched} hit(s), database: {self.db.path}"
-        )
-        if opts.save_cert:
-            self.console.print(
-                f"[green]PEM directory:[/] {certs_dir.resolve()} "
-                f"({saved_pems} new file(s) this run)"
+        if not opts.quiet_done:
+            done_hits = (
+                len(opts.global_known)
+                if global_mode and opts.global_known is not None
+                else matched
             )
+            self._print(
+                opts,
+                f"[green]Done.[/] {done_hits} hit(s), database: {self.db.path}",
+            )
+        if opts.save_cert and not opts.quiet_done:
+            self._print(
+                opts,
+                f"[green]PEM directory:[/] {certs_dir.resolve()} "
+                f"({saved_pems} new file(s) this run)",
+            )
+        if global_mode and opts.global_known is not None:
+            return len(opts.global_known)
         return matched
 
     def _new_job(
-        self, opts: ScanOptions, tree_size: int
+        self, opts: ScanOptions, tree_size: int, global_mode: bool
     ) -> tuple[int, int, set[str], int]:
+        per_log_target = opts.global_target if global_mode else opts.target_count
         job_id = self.db.create_job(
             opts.log_uri,
             tree_size,
-            opts.target_count,
+            per_log_target or opts.target_count,
             opts.job_query if opts.job_query is not None else opts.query,
             opts.nxdomain_mode,
+            session_id=opts.session_id,
         )
-        return job_id, tree_size - 1, set(), 0
+        known: set[str] = set()
+        if global_mode and opts.global_known is not None:
+            known |= opts.global_known
+        return job_id, tree_size - 1, known, 0
 
     def _try_match(
         self,

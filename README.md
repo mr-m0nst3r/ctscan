@@ -39,7 +39,22 @@ ctscan --help
 
 ## Typical workflow
 
-### 1. Scan with a fixed log and filter
+### 1. Scan with a time interval (auto-select logs)
+
+Match CT logs whose **`temporal_interval`** overlaps your range (from `all_logs_list.json`), then scan in parallel **by CT operator** until `--target` **unique domains** are reached:
+
+```bash
+ctscan scan \
+  --from 2026-01-01 --to 2026-06-30 \
+  --query "issuer_cn = 'CFCA TLS EV OCA'" \
+  --target 20
+```
+
+By default one worker runs per **operator** (Google, Cloudflare, DigiCert, …); each worker scans that operator's logs sequentially. Cap parallel operators with `--concurrency 2`. Duplicate domains across logs/operators count once toward `--target`. Re-running the same interval + query resumes the session and skips logs already completed in that session.
+
+Only **`usable`** logs are included by default; add `--include-all-states` to widen. Omit `--to` to use today; omit `--from` to search from 2013-01-01.
+
+### 2. Scan with a fixed log and filter
 
 ```bash
 ctscan scan \
@@ -48,7 +63,7 @@ ctscan scan \
   --target 10
 ```
 
-### 2. Interactive log selection (`--pick`)
+### 3. Interactive log selection (`--pick`)
 
 ```bash
 ctscan scan --pick \
@@ -65,7 +80,7 @@ Three prompts: **year → operator → log** (enter a number; Enter defaults to 
 - Prefer logs in **`usable`** state. **`unknown`** often means the log list entry has no `state` field; prefer **2026/2027** logs when scanning.
 - For Google Argon: year **2026** → operator **Google** → **Argon2026h1**.
 
-### 3. Inspect jobs and export
+### 4. Inspect jobs and export
 
 Each `scan` creates a row in `scan_jobs` (unless resuming a `running` job). Hits live in `matches`, deduplicated by `(job_id, domain)`.
 
@@ -89,7 +104,7 @@ ctscan export -o everything.csv --all
 - `ctscan export -o ten.csv --job-id <first-job-id>` → 10 rows
 - `ctscan export -o all.csv --all` → 13 rows (if nothing was purged)
 
-### 4. Save certificate PEM
+### 5. Save certificate PEM
 
 ```bash
 ctscan scan --log-uri "https://ct.googleapis.com/logs/us1/argon2026h1/" \
@@ -99,7 +114,7 @@ ctscan save-certs
 ctscan save-certs --job-id 3 --certs-dir ./my-certs
 ```
 
-### 5. Purge data
+### 6. Purge data
 
 `purge` requires exactly one of: `--job-id`, `--all`, `--completed`. Confirmation prompt unless `--yes`.
 
@@ -115,8 +130,13 @@ ctscan purge --all --yes         # wipe database
 
 | Option | Description |
 |--------|-------------|
-| `--log-uri` | CT log base URL |
-| `--pick` | Interactive log picker (mutually exclusive with `--log-uri`) |
+| `--log-uri` | CT log base URL (mutually exclusive with `--pick` and `--from`/`--to`) |
+| `--pick` | Interactive log picker (mutually exclusive with `--log-uri` and `--from`/`--to`) |
+| `--from` | Interval start `YYYY-MM-DD`; auto-select overlapping CT logs |
+| `--to` | Interval end `YYYY-MM-DD` (inclusive); default today when `--from` is set |
+| `--concurrency`, `-j` | Max parallel CT operators for interval scan (default: all operators) |
+| `--refresh` | Refresh log list before resolving `--from`/`--to` |
+| `--usable-only` / `--include-all-states` | When using `--from`/`--to`, default skips non-usable logs |
 | `--query`, `-q` | SQL-like filter (see below) |
 | `--filter`, `-f` | Python expression (**mutually exclusive** with `-q`) |
 | `--rules`, `-r` | JSON rules file (can combine with `-q`/`-f`) |
@@ -132,7 +152,7 @@ ctscan purge --all --yes         # wipe database
 | `--use-env-proxy` | Use `HTTP_PROXY`/`HTTPS_PROXY` (default: direct, no env proxy) |
 | `--db` | Custom SQLite path |
 
-**Resume:** same `log_uri` + existing `running` job → continue from `next_end_index`. Different log or `--no-resume` → new job.
+**Resume:** single-log scans resume by `log_uri`. Interval scans create a **session** (matched by `--from`, `--to`, and query); unique domains across all session jobs count toward `--target`. Per-log checkpoints resume within the session; completed logs are skipped on re-run. Use `--no-resume` to start a fresh session.
 
 ---
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import time
 from collections import defaultdict
+from datetime import date
 from pathlib import Path
 
 import httpx
@@ -348,3 +349,61 @@ def group_logs_by_operator(logs: list[CtLogInfo]) -> dict[str, list[CtLogInfo]]:
     for log in logs:
         grouped[log.operator].append(log)
     return dict(sorted(grouped.items()))
+
+
+def parse_iso_date(value: str) -> date | None:
+    """Parse ``YYYY-MM-DD`` (or longer ISO prefix). Returns None for empty/N/A."""
+    if not value or value == "N/A":
+        return None
+    try:
+        return date.fromisoformat(value[:10])
+    except ValueError:
+        return None
+
+
+def log_overlaps_interval(log: CtLogInfo, start: date, end: date) -> bool:
+    """
+    True if log ``temporal_interval`` overlaps ``[start, end]`` (inclusive days).
+
+    Log list ``end`` is ``end_exclusive`` (last active day is the day before).
+    """
+    log_start = parse_iso_date(log.start)
+    if log_start is None:
+        return False
+    log_end = parse_iso_date(log.end)
+    if log_start > end:
+        return False
+    if log_end is not None and log_end <= start:
+        return False
+    return True
+
+
+def select_logs_for_interval(
+    logs: list[CtLogInfo],
+    start: date,
+    end: date,
+    *,
+    usable_only: bool = True,
+) -> list[CtLogInfo]:
+    """
+    Logs whose temporal interval overlaps ``[start, end]``, newest first.
+
+    Skips entries without a URL. When ``usable_only``, keeps ``state == usable``.
+    """
+    if start > end:
+        raise ValueError("start date must be on or before end date")
+
+    selected: list[CtLogInfo] = []
+    for log in logs:
+        if usable_only and log.state != "usable":
+            continue
+        if not log.url.strip():
+            continue
+        if log_overlaps_interval(log, start, end):
+            selected.append(log)
+
+    selected.sort(
+        key=lambda log: (parse_iso_date(log.start) or date.min, log.description),
+        reverse=True,
+    )
+    return selected
